@@ -1,4 +1,4 @@
-__version__ = (1, 0, 1)
+__version__ = (1, 0, 2)
 
 # meta developer: @arachnophiliac
 
@@ -9,6 +9,7 @@ import re
 import stat
 import sys
 import time
+import uuid
 from pathlib import Path
 
 try:
@@ -57,6 +58,10 @@ class FileManagerMod(loader.Module):
         "run_timeout": "Process timed out.",
         "send_done": "File sent.",
         "send_failed": "Send failed: <code>{error}</code>",
+        "send_target_missing": "Cannot resolve target chat for sending.",
+        "read_failed": "Read failed: <code>{error}</code>",
+        "read_binary": "This looks like a binary file.",
+        "read_empty": "File is empty.",
     }
 
     def __init__(self):
@@ -85,10 +90,24 @@ class FileManagerMod(loader.Module):
                 "Run timeout in seconds",
                 validator=loader.validators.Integer(minimum=1, maximum=300),
             ),
+            loader.ConfigValue(
+                "read_max_bytes",
+                262144,
+                "Max bytes to read from a file",
+                validator=loader.validators.Integer(minimum=1024, maximum=5242880),
+            ),
+            loader.ConfigValue(
+                "read_page_chars",
+                2800,
+                "Characters per read page",
+                validator=loader.validators.Integer(minimum=800, maximum=3500),
+            ),
         )
+        self._sessions = {}
 
     async def client_ready(self, client, db):
         self._client = client
+        self.client = client
 
     def _button(self, text: str, callback, args=(), style=None) -> dict:
         button = {"text": text, "callback": callback, "args": tuple(args)}
@@ -106,6 +125,91 @@ class FileManagerMod(loader.Module):
         if style:
             button["style"] = style
         return button
+
+    def _target_from_value(self, value):
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            for key in ("chat_id", "peer_id", "to_id", "id"):
+                if value.get(key) is not None:
+                    return value[key]
+            return None
+        for attr in ("chat_id", "peer_id", "to_id", "id"):
+            attr_value = getattr(value, attr, None)
+            if attr_value is not None:
+                return attr_value
+        return value
+
+    def _target_from_source(self, source):
+        if source is None:
+            return None
+        for attr in ("chat_id", "peer_id", "to_id"):
+            value = getattr(source, attr, None)
+            if value is not None:
+                return value
+        return self._target_from_value(getattr(source, "chat", None))
+
+    def _message_id_from_source(self, source):
+        if source is None:
+            return None
+        if isinstance(source, dict):
+            for key in ("message_id", "msg_id", "id"):
+                if source.get(key) is not None:
+                    return source[key]
+            return None
+        for attr in ("message_id", "msg_id", "id"):
+            value = getattr(source, attr, None)
+            if value is not None:
+                return value
+        return None
+
+    def _new_session(self, message: Message) -> str:
+        sid = uuid.uuid4().hex[:10]
+        self._sessions[sid] = {
+            "chat_id": self._target_from_source(message),
+            "message_id": self._message_id_from_source(message),
+            "created_at": time.time(),
+        }
+        if len(self._sessions) > 64:
+            oldest = sorted(
+                self._sessions,
+                key=lambda item: self._sessions[item].get("created_at", 0),
+            )
+            for old_sid in oldest[:-64]:
+                self._sessions.pop(old_sid, None)
+        return sid
+
+    def _call_target(self, call: InlineCall, sid: str | None = None) -> tuple[object | None, int | None]:
+        session = self._sessions.get(sid or "", {})
+        chat_id = session.get("chat_id")
+        message_id = session.get("message_id")
+
+        for source in (call, getattr(call, "message", None)):
+            if source is None:
+                continue
+            if chat_id is None:
+                chat_id = self._target_from_source(source)
+            if message_id is None:
+                message_id = self._message_id_from_source(source)
+
+        for form in (getattr(call, "form", None), getattr(call, "_form", None)):
+            if not form:
+                continue
+            if isinstance(form, dict):
+                if chat_id is None:
+                    for key in ("chat_id", "peer_id", "to_id", "chat"):
+                        chat_id = self._target_from_value(form.get(key))
+                        if chat_id is not None:
+                            break
+                if message_id is None:
+                    message_id = self._message_id_from_source(form)
+            else:
+                if chat_id is None:
+                    chat_id = self._target_from_source(form)
+                if message_id is None:
+                    message_id = self._message_id_from_source(form)
+
+        return chat_id, message_id
 
     async def _safe_answer(self, call: InlineCall, text: str | None = None, **kwargs):
         with contextlib.suppress(Exception):
@@ -243,11 +347,11 @@ class FileManagerMod(loader.Module):
         entries.sort(key=lambda item: (not item.is_dir(), item.name.lower()))
         return entries
 
-    async def _dir_view(self, path: Path, page: int = 0) -> tuple[str, list]:
+    async def _dir_view(self, path: Path, page: int = 0, sid: str | None = None) -> tuple[str, list]:
         if not path.exists():
             return self.strings["not_found"], [[{"text": "Close", "action": "close"}]]
         if not path.is_dir():
-            return self._file_view(path)
+            return self._file_view(path, sid=sid)
 
         try:
             entries = self._dir_entries(path)
@@ -273,20 +377,20 @@ class FileManagerMod(loader.Module):
         start = page * per_page
         rows = []
         for item in entries[start : start + per_page]:
-            rows.append([self._button(self._entry_label(item), self._open_path, (str(item), 0))])
+            rows.append([self._button(self._entry_label(item), self._open_path, (str(item), 0, sid))])
 
         nav = []
         if page > 0:
-            nav.append(self._button("Prev", self._open_path, (str(path), page - 1)))
-        nav.append(self._button(f"{page + 1}/{total_pages}", self._open_path, (str(path), page)))
+            nav.append(self._button("Prev", self._open_path, (str(path), page - 1, sid)))
+        nav.append(self._button(f"{page + 1}/{total_pages}", self._open_path, (str(path), page, sid)))
         if page < total_pages - 1:
-            nav.append(self._button("Next", self._open_path, (str(path), page + 1)))
+            nav.append(self._button("Next", self._open_path, (str(path), page + 1, sid)))
         rows.append(nav)
 
         rows.append(
             [
-                self._button("Up", self._open_path, (str(self._parent_path(path)), 0), "primary"),
-                self._input_button("Jump", "Enter path", self._jump_input, (str(path),), "primary"),
+                self._button("Up", self._open_path, (str(self._parent_path(path)), 0, sid), "primary"),
+                self._input_button("Jump", "Enter path", self._jump_input, (str(path), sid), "primary"),
             ]
         )
         rows.append(
@@ -295,7 +399,7 @@ class FileManagerMod(loader.Module):
                     "Mkdir",
                     self.strings["mkdir_prompt"],
                     self._mkdir_input,
-                    (str(path),),
+                    (str(path), sid),
                     "success",
                 )
             ]
@@ -303,38 +407,39 @@ class FileManagerMod(loader.Module):
         rows.append([{"text": "Close", "action": "close"}])
         return text, rows
 
-    def _file_view(self, path: Path) -> tuple[str, list]:
+    def _file_view(self, path: Path, sid: str | None = None) -> tuple[str, list]:
         rows = []
         if path.is_file():
             rows.append(
                 [
-                    self._button("Send", self._send_file, (str(path),), "success"),
-                    self._button("Run", self._run_file, (str(path),), "primary"),
+                    self._button("Send", self._send_file, (str(path), sid), "success"),
+                    self._button("Read", self._read_file, (str(path), 0, sid), "primary"),
+                    self._button("Run", self._run_file, (str(path), sid), "primary"),
                 ]
             )
         rows.append(
             [
-                self._input_button("Chmod", self.strings["chmod_prompt"], self._chmod_input, (str(path),), "primary"),
-                self._button("Delete", self._confirm_delete, (str(path),), "danger"),
+                self._input_button("Chmod", self.strings["chmod_prompt"], self._chmod_input, (str(path), sid), "primary"),
+                self._button("Delete", self._confirm_delete, (str(path), sid), "danger"),
             ]
         )
         rows.append(
             [
-                self._button("Back", self._open_path, (str(self._parent_path(path)), 0), "primary"),
+                self._button("Back", self._open_path, (str(self._parent_path(path)), 0, sid), "primary"),
                 {"text": "Close", "action": "close"},
             ]
         )
         return self._stat_text(path), rows
 
-    async def _open_path(self, call: InlineCall, raw_path: str, page: int = 0):
+    async def _open_path(self, call: InlineCall, raw_path: str, page: int = 0, sid: str | None = None):
         await self._safe_answer(call)
         path = self._resolve_path(raw_path)
         if not path:
             return await call.edit(self.strings["bad_path"], reply_markup=[[{"text": "Close", "action": "close"}]])
-        text, markup = await self._dir_view(path, page)
+        text, markup = await self._dir_view(path, page, sid=sid)
         await call.edit(text, reply_markup=markup)
 
-    async def _jump_input(self, call: InlineCall, data, current_path: str):
+    async def _jump_input(self, call: InlineCall, data, current_path: str, sid: str | None = None):
         base = self._resolve_path(current_path) or self._base_path()
         path = self._resolve_path(str(data or ""), base=base)
         if not path:
@@ -347,10 +452,10 @@ class FileManagerMod(loader.Module):
                     self.strings["mkdir_failed"].format(error=utils.escape_html(error)),
                     show_alert=True,
                 )
-        text, markup = await self._dir_view(path, 0)
+        text, markup = await self._dir_view(path, 0, sid=sid)
         await call.edit(text, reply_markup=markup)
 
-    async def _mkdir_input(self, call: InlineCall, data, current_path: str):
+    async def _mkdir_input(self, call: InlineCall, data, current_path: str, sid: str | None = None):
         base = self._resolve_path(current_path)
         if not base or not base.is_dir():
             return await self._safe_answer(call, self.strings["not_dir"], show_alert=True)
@@ -372,10 +477,10 @@ class FileManagerMod(loader.Module):
             self.strings["mkdir_done"].format(path=str(path)),
             show_alert=False,
         )
-        text, markup = await self._dir_view(base, 0)
+        text, markup = await self._dir_view(base, 0, sid=sid)
         await call.edit(text, reply_markup=markup)
 
-    async def _confirm_delete(self, call: InlineCall, raw_path: str):
+    async def _confirm_delete(self, call: InlineCall, raw_path: str, sid: str | None = None):
         await self._safe_answer(call)
         path = self._resolve_path(raw_path)
         if not path or not path.exists():
@@ -384,14 +489,14 @@ class FileManagerMod(loader.Module):
             self.strings["delete_confirm"].format(path=self._path_text(path)),
             reply_markup=[
                 [
-                    self._button("Delete", self._delete_path, (str(path),), "danger"),
-                    self._button("Cancel", self._open_path, (str(path), 0), "primary"),
+                    self._button("Delete", self._delete_path, (str(path), sid), "danger"),
+                    self._button("Cancel", self._open_path, (str(path), 0, sid), "primary"),
                 ],
                 [{"text": "Close", "action": "close"}],
             ],
         )
 
-    async def _delete_path(self, call: InlineCall, raw_path: str):
+    async def _delete_path(self, call: InlineCall, raw_path: str, sid: str | None = None):
         path = self._resolve_path(raw_path)
         if not path or not path.exists():
             return await self._safe_answer(call, self.strings["not_found"], show_alert=True)
@@ -414,10 +519,10 @@ class FileManagerMod(loader.Module):
             self.strings["deleted"].format(path=str(path)),
             show_alert=False,
         )
-        text, markup = await self._dir_view(parent, 0)
+        text, markup = await self._dir_view(parent, 0, sid=sid)
         await call.edit(text, reply_markup=markup)
 
-    async def _chmod_input(self, call: InlineCall, data, raw_path: str):
+    async def _chmod_input(self, call: InlineCall, data, raw_path: str, sid: str | None = None):
         mode_text = str(data or "").strip()
         if not MODE_RE.fullmatch(mode_text):
             return await self._safe_answer(call, self.strings["chmod_bad"], show_alert=True)
@@ -436,32 +541,145 @@ class FileManagerMod(loader.Module):
             self.strings["chmod_done"].format(mode=mode_text),
             show_alert=False,
         )
-        text, markup = await self._dir_view(path, 0)
+        text, markup = await self._dir_view(path, 0, sid=sid)
         await call.edit(text, reply_markup=markup)
 
-    async def _send_file(self, call: InlineCall, raw_path: str):
+    async def _send_file(self, call: InlineCall, raw_path: str, sid: str | None = None):
         await self._safe_answer(call)
         path = self._resolve_path(raw_path)
         if not path or not path.is_file():
             return await self._safe_answer(call, self.strings["not_file"], show_alert=True)
 
-        chat_id = getattr(call, "chat_id", None)
+        chat_id, message_id = self._call_target(call, sid=sid)
         if chat_id is None:
-            return await self._safe_answer(call, "Chat id is unavailable.", show_alert=True)
+            return await self._safe_answer(call, self.strings["send_target_missing"], show_alert=True)
+
+        client = getattr(self, "_client", None) or getattr(self, "client", None)
+        if client is None:
+            return await self._safe_answer(
+                call,
+                self.strings["send_failed"].format(error="client is unavailable"),
+                show_alert=True,
+            )
+
+        caption = f"<code>{self._path_text(path)}</code>"
 
         try:
-            await self._client.send_file(
+            await client.send_file(
                 chat_id,
                 str(path),
-                caption=f"<code>{self._path_text(path)}</code>",
+                reply_to=message_id,
+                caption=caption,
+                parse_mode="html",
+                force_document=True,
             )
         except Exception as e:
+            if message_id is not None and self._is_bad_reply_error(e):
+                try:
+                    await client.send_file(
+                        chat_id,
+                        str(path),
+                        reply_to=None,
+                        caption=caption,
+                        parse_mode="html",
+                        force_document=True,
+                    )
+                except Exception as retry_error:
+                    return await self._safe_answer(
+                        call,
+                        self.strings["send_failed"].format(
+                            error=utils.escape_html(str(retry_error))
+                        ),
+                        show_alert=True,
+                    )
+                return await self._safe_answer(call, self.strings["send_done"], show_alert=False)
             return await self._safe_answer(
                 call,
                 self.strings["send_failed"].format(error=utils.escape_html(str(e))),
                 show_alert=True,
             )
         await self._safe_answer(call, self.strings["send_done"], show_alert=False)
+
+    def _is_bad_reply_error(self, error: Exception) -> bool:
+        text = str(error or "").lower()
+        return (
+            "messageidinvalid" in text
+            or "message id invalid" in text
+            or "msg_id_invalid" in text
+            or ("reply" in text and "invalid" in text)
+        )
+
+    def _read_file_pages(self, path: Path) -> tuple[list[str] | None, str | None]:
+        try:
+            with path.open("rb") as file_obj:
+                data = file_obj.read(int(self.config["read_max_bytes"]) + 1)
+        except Exception as e:
+            return None, str(e)
+
+        max_bytes = int(self.config["read_max_bytes"])
+        truncated = len(data) > max_bytes
+        data = data[:max_bytes]
+
+        if not data:
+            return [self.strings["read_empty"]], None
+        if b"\x00" in data[:4096]:
+            return [self.strings["read_binary"]], None
+
+        text = data.decode("utf-8", errors="replace")
+        if truncated:
+            text += "\n\n... truncated ..."
+
+        page_size = int(self.config["read_page_chars"])
+        pages = [text[idx : idx + page_size] for idx in range(0, len(text), page_size)]
+        return pages or [self.strings["read_empty"]], None
+
+    async def _read_file(
+        self,
+        call: InlineCall,
+        raw_path: str,
+        page: int = 0,
+        sid: str | None = None,
+    ):
+        await self._safe_answer(call)
+        path = self._resolve_path(raw_path)
+        if not path or not path.is_file():
+            return await self._safe_answer(call, self.strings["not_file"], show_alert=True)
+
+        pages, error = self._read_file_pages(path)
+        if error:
+            return await self._safe_answer(
+                call,
+                self.strings["read_failed"].format(error=utils.escape_html(error)),
+                show_alert=True,
+            )
+
+        total = len(pages)
+        page = max(0, min(int(page), total - 1))
+        body = pages[page]
+        text = (
+            f"<b>Read: {utils.escape_html(path.name)}</b> "
+            f"<code>{page + 1}/{total}</code>\n"
+            f"Path: <code>{self._path_text(path)}</code>\n\n"
+            f"<blockquote><code>{utils.escape_html(body)}</code></blockquote>"
+        )
+
+        nav = []
+        if page > 0:
+            nav.append(self._button("Prev", self._read_file, (str(path), page - 1, sid), "primary"))
+        nav.append(self._button(f"{page + 1}/{total}", self._read_file, (str(path), page, sid)))
+        if page < total - 1:
+            nav.append(self._button("Next", self._read_file, (str(path), page + 1, sid), "primary"))
+
+        await call.edit(
+            text,
+            reply_markup=[
+                nav,
+                [
+                    self._button("Back", self._open_path, (str(path), 0, sid), "primary"),
+                    {"text": "Close", "action": "close"},
+                ],
+            ],
+        )
 
     def _run_argv(self, path: Path) -> list[str] | None:
         if path.suffix.lower() in SCRIPT_INTERPRETERS:
@@ -483,7 +701,7 @@ class FileManagerMod(loader.Module):
             f"<blockquote><code>{utils.escape_html(output)}</code></blockquote>"
         )
 
-    async def _run_file(self, call: InlineCall, raw_path: str):
+    async def _run_file(self, call: InlineCall, raw_path: str, sid: str | None = None):
         await self._safe_answer(call)
         path = self._resolve_path(raw_path)
         if not path or not path.is_file():
@@ -528,7 +746,7 @@ class FileManagerMod(loader.Module):
             text,
             reply_markup=[
                 [
-                    self._button("Back", self._open_path, (str(path), 0), "primary"),
+                    self._button("Back", self._open_path, (str(path), 0, sid), "primary"),
                     {"text": "Close", "action": "close"},
                 ]
             ],
@@ -571,6 +789,7 @@ class FileManagerMod(loader.Module):
     async def fman(self, message: Message):
         """Open inline file manager."""
         raw = utils.get_args_raw(message).strip()
+        sid = self._new_session(message)
         path = self._resolve_path(raw) if raw else self._base_path()
         if not path:
             return await utils.answer(message, self.strings["bad_path"])
@@ -582,7 +801,7 @@ class FileManagerMod(loader.Module):
                     self.strings["mkdir_failed"].format(error=utils.escape_html(error)),
                 )
 
-        text, markup = await self._dir_view(path, 0)
+        text, markup = await self._dir_view(path, 0, sid=sid)
         await self.inline.form(
             text=text,
             message=message,
