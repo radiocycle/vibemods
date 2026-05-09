@@ -1,4 +1,4 @@
-__version__ = (1, 0, 2)
+__version__ = (1, 0, 3)
 
 # meta developer: @arachnophiliac
 
@@ -31,7 +31,7 @@ SCRIPT_INTERPRETERS = {
 
 @loader.tds
 class FileManagerMod(loader.Module):
-    """Inline file manager with save, send, run, chmod, and delete actions."""
+    """Inline file manager with save, send, read, run, mkdir, rmdir, chmod, and delete actions."""
 
     strings = {
         "name": "FileManager",
@@ -47,6 +47,9 @@ class FileManagerMod(loader.Module):
         "mkdir_prompt": "Enter new directory name or relative path",
         "mkdir_done": "Created directory: <code>{path}</code>",
         "mkdir_failed": "Create directory failed: <code>{error}</code>",
+        "rmdir_prompt": "Enter empty directory name or relative path",
+        "rmdir_done": "Removed directory: <code>{path}</code>",
+        "rmdir_failed": "Remove directory failed: <code>{error}</code>",
         "delete_confirm": "Delete <code>{path}</code>?",
         "deleted": "Deleted: <code>{path}</code>",
         "delete_failed": "Delete failed: <code>{error}</code>",
@@ -401,7 +404,14 @@ class FileManagerMod(loader.Module):
                     self._mkdir_input,
                     (str(path), sid),
                     "success",
-                )
+                ),
+                self._input_button(
+                    "Rmdir",
+                    self.strings["rmdir_prompt"],
+                    self._rmdir_input,
+                    (str(path), sid),
+                    "danger",
+                ),
             ]
         )
         rows.append([{"text": "Close", "action": "close"}])
@@ -475,6 +485,36 @@ class FileManagerMod(loader.Module):
         await self._safe_answer(
             call,
             self.strings["mkdir_done"].format(path=str(path)),
+            show_alert=False,
+        )
+        text, markup = await self._dir_view(base, 0, sid=sid)
+        await call.edit(text, reply_markup=markup)
+
+    async def _rmdir_input(self, call: InlineCall, data, current_path: str, sid: str | None = None):
+        base = self._resolve_path(current_path)
+        if not base or not base.is_dir():
+            return await self._safe_answer(call, self.strings["not_dir"], show_alert=True)
+
+        path = self._resolve_new_dir_path(str(data or ""), base)
+        if not path:
+            return await self._safe_answer(call, self.strings["bad_path"], show_alert=True)
+        if not path.exists():
+            return await self._safe_answer(call, self.strings["not_found"], show_alert=True)
+        if not path.is_dir():
+            return await self._safe_answer(call, self.strings["not_dir"], show_alert=True)
+
+        try:
+            path.rmdir()
+        except Exception as e:
+            return await self._safe_answer(
+                call,
+                self.strings["rmdir_failed"].format(error=utils.escape_html(str(e))),
+                show_alert=True,
+            )
+
+        await self._safe_answer(
+            call,
+            self.strings["rmdir_done"].format(path=str(path)),
             show_alert=False,
         )
         text, markup = await self._dir_view(base, 0, sid=sid)
