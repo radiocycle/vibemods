@@ -1,4 +1,4 @@
-__version__ = (1, 0, 0)
+__version__ = (1, 0, 1)
 
 # meta developer: @arachnophiliac
 
@@ -43,6 +43,9 @@ class FileManagerMod(loader.Module):
         "not_dir": "This action requires a directory.",
         "permission_error": "Permission denied.",
         "empty_dir": "Directory is empty.",
+        "mkdir_prompt": "Enter new directory name or relative path",
+        "mkdir_done": "Created directory: <code>{path}</code>",
+        "mkdir_failed": "Create directory failed: <code>{error}</code>",
         "delete_confirm": "Delete <code>{path}</code>?",
         "deleted": "Deleted: <code>{path}</code>",
         "delete_failed": "Delete failed: <code>{error}</code>",
@@ -130,6 +133,32 @@ class FileManagerMod(loader.Module):
             return path.resolve(strict=False)
         except Exception:
             return None
+
+    def _resolve_new_dir_path(self, raw: str, base: Path) -> Path | None:
+        if raw is None or "\x00" in str(raw):
+            return None
+        value = str(raw).strip()
+        if not value:
+            return None
+
+        requested = Path(value)
+        if requested.is_absolute():
+            return None
+
+        if any(part in {"", ".", ".."} for part in requested.parts):
+            return None
+        return self._resolve_path(value, base=base)
+
+    async def _ensure_directory(self, path: Path) -> tuple[bool, str]:
+        if path.exists():
+            if path.is_dir():
+                return True, ""
+            return False, self.strings["not_dir"]
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return False, str(e)
+        return True, ""
 
     def _safe_filename(self, name: str | None, fallback: str = "telegram_file") -> str:
         name = os.path.basename(str(name or "").replace("\x00", "")).strip()
@@ -260,6 +289,17 @@ class FileManagerMod(loader.Module):
                 self._input_button("Jump", "Enter path", self._jump_input, (str(path),), "primary"),
             ]
         )
+        rows.append(
+            [
+                self._input_button(
+                    "Mkdir",
+                    self.strings["mkdir_prompt"],
+                    self._mkdir_input,
+                    (str(path),),
+                    "success",
+                )
+            ]
+        )
         rows.append([{"text": "Close", "action": "close"}])
         return text, rows
 
@@ -299,7 +339,40 @@ class FileManagerMod(loader.Module):
         path = self._resolve_path(str(data or ""), base=base)
         if not path:
             return await self._safe_answer(call, self.strings["bad_path"], show_alert=True)
+        if not path.exists():
+            ok, error = await self._ensure_directory(path)
+            if not ok:
+                return await self._safe_answer(
+                    call,
+                    self.strings["mkdir_failed"].format(error=utils.escape_html(error)),
+                    show_alert=True,
+                )
         text, markup = await self._dir_view(path, 0)
+        await call.edit(text, reply_markup=markup)
+
+    async def _mkdir_input(self, call: InlineCall, data, current_path: str):
+        base = self._resolve_path(current_path)
+        if not base or not base.is_dir():
+            return await self._safe_answer(call, self.strings["not_dir"], show_alert=True)
+
+        path = self._resolve_new_dir_path(str(data or ""), base)
+        if not path:
+            return await self._safe_answer(call, self.strings["bad_path"], show_alert=True)
+
+        ok, error = await self._ensure_directory(path)
+        if not ok:
+            return await self._safe_answer(
+                call,
+                self.strings["mkdir_failed"].format(error=utils.escape_html(error)),
+                show_alert=True,
+            )
+
+        await self._safe_answer(
+            call,
+            self.strings["mkdir_done"].format(path=str(path)),
+            show_alert=False,
+        )
+        text, markup = await self._dir_view(base, 0)
         await call.edit(text, reply_markup=markup)
 
     async def _confirm_delete(self, call: InlineCall, raw_path: str):
@@ -501,6 +574,13 @@ class FileManagerMod(loader.Module):
         path = self._resolve_path(raw) if raw else self._base_path()
         if not path:
             return await utils.answer(message, self.strings["bad_path"])
+        if not path.exists():
+            ok, error = await self._ensure_directory(path)
+            if not ok:
+                return await utils.answer(
+                    message,
+                    self.strings["mkdir_failed"].format(error=utils.escape_html(error)),
+                )
 
         text, markup = await self._dir_view(path, 0)
         await self.inline.form(
