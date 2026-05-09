@@ -6,3 +6,4 @@ profilemanager
 pushistikjsonconv
 pushistiktime
 tempchats
+audiotools
