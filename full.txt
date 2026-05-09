@@ -1,4 +1,5 @@
 SystemdManager
+FileManager
 kittypics
 kittyserv
 njs
