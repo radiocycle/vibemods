@@ -8,3 +8,4 @@ pushistikjsonconv
 pushistiktime
 tempchats
 audiotools
+Whisper
