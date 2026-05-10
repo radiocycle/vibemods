@@ -494,7 +494,11 @@ class LazyQuotesMod(loader.Module):
         if not dt:
             return None
         from datetime import timezone, timedelta
-        tz = timezone(timedelta(hours=int(self.config["timezone"])))
+        offset = timedelta(hours=int(self.config["timezone"]))
+        tz = timezone(offset)
+        # Telethon иногда отдаёт naive datetime — принудительно считаем UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(tz).strftime("%H:%M")
 
     async def _unsave_reply_gif(self, client, reply) -> None:
