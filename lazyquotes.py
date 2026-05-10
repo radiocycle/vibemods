@@ -24,7 +24,6 @@ except ImportError:
     HAS_PILMOJI = False
 
 from telethon.tl.functions.messages import SaveGifRequest
-from telethon.tl.functions.photos import GetUserPhotosRequest
 from telethon.tl.types import InputDocument
 
 from .. import loader, utils
@@ -339,11 +338,10 @@ async def _download_with_mime(url: str) -> tuple[bytes, str, str]:
 
 async def _get_avatar(client, user) -> bytes | None:
     try:
-        photos = await client(GetUserPhotosRequest(user_id=user.id, offset=0, max_id=0, limit=1))
-        if not photos.photos:
-            return None
         buf = io.BytesIO()
-        await client.download_media(photos.photos[0], buf)
+        result = await client.download_profile_photo(user, file=buf, download_big=False)
+        if result is None:
+            return None
         buf.seek(0)
         return buf.read()
     except Exception:
