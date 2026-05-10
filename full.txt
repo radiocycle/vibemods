@@ -9,3 +9,4 @@ pushistiktime
 tempchats
 audiotools
 Whisper
+lazyquotes
